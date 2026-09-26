@@ -1779,6 +1779,16 @@ def write_files(valid: List[tuple]) -> None:
 def confirm_write(args: argparse.Namespace) -> bool:
     if args.yes:
         return True
+
+    # Без терминала отвечать на вопрос некому: агент в opencode, CI, любой
+    # вызов из скрипта. Раньше это выглядело как «Отменено пользователем»,
+    # хотя пользователь ничего не отменял, — и было неясно, что делать.
+    if not sys.stdin.isatty():
+        warn("Запуск без терминала — подтвердить запись некому.")
+        info("Добавь флаг --yes, чтобы согласие не запрашивалось:")
+        print("  ./openspec.py --codegen --change <ID> --yes")
+        return False
+
     try:
         answer = input("\nЗаписать эти файлы? [y/N] ").strip().lower()
     except EOFError:
