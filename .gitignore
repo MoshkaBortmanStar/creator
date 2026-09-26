@@ -1,0 +1,5 @@
+# OpenSpec Change Driver
+__pycache__/
+*.pyc
+.venv/
+venv/
