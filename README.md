@@ -136,7 +136,7 @@ winget install astral-sh.uv        # Windows
 > ### Руками — одна команда, один раз на проект
 >
 > ```bash
-> uvx --from git+file:///Users/mikhailbutorin/programmer/creator@master openspec --init
+> uvx --from git+https://github.com/MoshkaBortmanStar/creator.git@master openspec --init
 > ```
 >
 > Она разворачивает проект и создаёт обёртку. **Дальше руками ничего
@@ -174,7 +174,7 @@ winget install astral-sh.uv        # Windows
 **Напрямую**, из корня проекта:
 
 ```bash
-uvx --from git+file:///Users/mikhailbutorin/programmer/creator@master openspec --init
+uvx --from git+https://github.com/MoshkaBortmanStar/creator.git@master openspec --init
 ```
 
 **Что делает:** разбирает проект в два прохода и создаёт всё нужное.
@@ -205,7 +205,7 @@ Go, Rust. Команда тестов подбирается под ОС: на W
 | проход 2 | `Kotlin 2.3.21 (toolchain Java 21), Spring Boot 4.1.1 (web, jdbc, flyway), SQLite, bcrypt/argon2, OpenAPI Generator 7.14.0…` |
 | `code_style` | `слоистая controller → service → repository, без JPA — plain JDBC; DTO из OpenAPI; корутины вместо реактивных типов; тесты интеграционные (*IT, WebTestClient)` |
 
-Второй проход необязательный: нет ключа, нет VPN, модель не ответила —
+Второй проход необязательный: нет ключа, нет сети, модель не ответила —
 `--init` доживёт до конца на результатах первого и скажет, что пропустил.
 Отключить заранее: `--offline`.
 
@@ -215,7 +215,7 @@ Go, Rust. Команда тестов подбирается под ОС: на W
 |---|---|---|
 | `.agent/config.yaml` | движок | стек, профиль, команда тестов |
 | `specs/` | движок | артефакты конвейера |
-| `openspec.py` | ты | запуск движка, в нём же задана версия |
+| `openspec.py` | ты | запуск движка, в нём же задана версия (в `.gitignore`) |
 | `.opencode/skills/` (15 штук), `.opencode/command/` | агент | конвейер плюс библиотека навыков (в `.gitignore`) |
 | `AGENTS.md` | агент | правило точечных правок вместо перепечатывания файлов (в `.gitignore`) |
 
@@ -276,21 +276,21 @@ Go, Rust. Команда тестов подбирается под ОС: на W
 
 | Файл | В git | Почему |
 |---|---|---|
-| `openspec.py` | **да** | иначе коллега клонирует и не сможет запустить; в нём же версия движка |
 | `.agent/config.yaml` | **да** | общие настройки: стек, команда тестов, раскладка исходников |
 | `specs/` | **да** | продукт работы и история решений |
+| `openspec.py` | нет | генерируется `--init` одинаковым у всех |
 | `.opencode/`, `AGENTS.md` | нет | инструкции агенту, разворачиваются `--init` локально |
 
-Граница простая: в репозиторий уходит то, без чего **нельзя воспроизвести
-результат**. Всё остальное каждый поднимает у себя одной командой.
+Граница: в репозиторий уходит только то, что **нельзя получить заново** —
+конфиг проекта и спеки. Всё, что `--init` создаёт из данных пакета, каждый
+разворачивает у себя той же командой.
 
-Файлов движка в репозитории **нет вообще** — только строка с адресом внутри
-`openspec.py`.
+Файлов движка в репозитории **нет вообще**.
 
 ### Шаг 2. Закоммитить
 
 ```bash
-git add openspec.py .agent specs .gitignore
+git add .agent specs .gitignore
 ```
 
 Проверь, что ушло именно это:
@@ -314,8 +314,7 @@ profiles:
     api_key_env: "ZAI_API_KEY"    # имя переменной, НЕ сам ключ
 ```
 
-Где взять сам ключ: в конфиге opencode — `~/.config/opencode/opencode.json`,
-секция `личном кабинете Z.AI`.
+Где взять сам ключ: в личном кабинете Z.AI (подписка Coding Plan).
 
 ```bash
 echo 'export ZAI_API_KEY="..."' >> ~/.zshenv
@@ -339,19 +338,20 @@ setx ZAI_API_KEY "..."
 echo ${ZAI_API_KEY:+ключ на месте}
 ```
 
-Что шлюз отвечает (нужен VPN):
+Что провайдер отвечает:
 
 ```bash
 curl -k -s -o /dev/null -w "HTTP %{http_code}\n" \
-  -X POST https://alfagen.moscow.alfaintra.net/continue-dev/chat/completions \
+  -X POST https://api.z.ai/api/coding/paas/v4/chat/completions \
   -H "Authorization: Bearer $ZAI_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"DeepSeek-V4.1-Flash","messages":[{"role":"user","content":"ping"}],"max_tokens":5}'
+  -d '{"model":"glm-5.3","messages":[{"role":"user","content":"ping"}],"max_tokens":5}'
 ```
 
-`200` — готово. `401` — ключ. `404` — имя модели. Домен не резолвится — нет VPN.
+`200` — готово. `401` — ключ. `404` — имя модели или endpoint: у Coding Plan
+путь `/api/coding/paas/v4`, обычный `/api/paas/v4` с ключом подписки не работает.
 
-Проверяй именно `/chat/completions`: `/models` на этом шлюзе отвечает и без
+Проверяй именно `/chat/completions`: `/models` отвечает и без
 валидного ключа, как проверка он бесполезен.
 
 ### Шаг 4. Проверить то, что машина знать не может
@@ -379,15 +379,16 @@ active_profile: "glm"     # или "local" — локальная модель �
 git clone <url> && cd <проект>
 ```
 
-Обёртка уже в репозитории, поэтому длинная команда с `uvx` не нужна:
+Обёртки в репозитории нет — она в `.gitignore`, поэтому первый запуск
+снова через `uvx`:
 
 ```bash
-./openspec.py --init
+uvx --from git+https://github.com/MoshkaBortmanStar/creator.git@master openspec --init
 ```
 
-Она добавит то, чего нет в git: скиллы, `AGENTS.md` и твой локальный
-конфиг, если его нет. Дальше пропиши ключ (шаг 3) — всё остальное
-уже на месте.
+Она создаст обёртку, скиллы и `AGENTS.md`. Конфиг и спеки уже в репозитории,
+их команда не тронет. Дальше пропиши ключ (шаг 3), и работай через
+`./openspec.py ...`.
 
 ---
 
@@ -396,7 +397,7 @@ git clone <url> && cd <проект>
 Версия задана **одной строкой** в `openspec.py`:
 
 ```python
-ENGINE = "git+file:///Users/mikhailbutorin/programmer/creator@master"
+ENGINE = "git+https://github.com/MoshkaBortmanStar/creator.git@master"
 ```
 
 | Что указать | Поведение |
@@ -432,63 +433,50 @@ openspec-driver 0.4.0
 
 
 
-Движок работает с **любым OpenAI-совместимым API**. Настройки — в
-`.agent/config.yaml`, секция `ai_settings`:
+Движок работает с **любым OpenAI-совместимым API**. Провайдер задаётся
+профилем в `.agent/config.yaml`:
 
-| Провайдер    | `base_url`                        | `model`            | Ключ                        |
-|--------------|-----------------------------------|--------------------|-----------------------------|
-| **AlfaGen** (корпоративный, уже настроен по умолчанию) | `https://alfagen.moscow.alfaintra.net/continue-dev` | `DeepSeek-V4.1-Flash` и др. | уже в `config.yaml` |
-| **Ollama** (локально, бесплатно) | `http://localhost:11434/v1` | `qwen2.5-coder:7b`, `llama3:8b` | не нужен |
-| **OpenAI**   | `https://api.openai.com/v1`       | `gpt-4o` / `gpt-4o-mini` | из переменной `OPENAI_API_KEY` |
-| **OpenRouter** | `https://openrouter.ai/api/v1` | `anthropic/claude-sonnet-4` и др. | из `OPENAI_API_KEY` |
+| Провайдер | `base_url` | `model` | Ключ |
+|---|---|---|---|
+| **Z.AI Coding Plan** (по умолчанию) | `https://api.z.ai/api/coding/paas/v4` | `glm-5.3` | `ZAI_API_KEY` |
+| **Ollama** (локально, бесплатно) | `http://localhost:11434/v1` | `qwen2.5-coder:7b` | не нужен |
+| **OpenAI** | `https://api.openai.com/v1` | `gpt-4o` | `OPENAI_API_KEY` |
+| **OpenRouter** | `https://openrouter.ai/api/v1` | `anthropic/claude-sonnet-4` | `OPENROUTER_API_KEY` |
 
-> **AlfaGen доступен только из корпоративной сети / VPN** — вне сети DNS
-> не резолвится, и это нормально. Дома переключайся на Ollama/OpenAI
-> (см. ниже «Как быстро поменять модель»).
+> **У Z.AI Coding Plan отдельный endpoint** — `/api/coding/paas/v4`.
+> Обычный `/api/paas/v4` это pay-as-you-go, ключ подписки там **не работает**
+> и вернёт `401`.
 
 ### Как быстро поменять модель
 
-**Способ 1 — навсегда (правка конфига).** Открой `.agent/config.yaml` и
-поменяй одну строку:
+**Способ 1 — навсегда (правка конфига).** Модель живёт в профиле:
 
 ```yaml
-ai_settings:
-  base_url: "https://alfagen.moscow.alfaintra.net/continue-dev"
-  model: "DeepSeek-V4.1-Flash"          # ← поменяй на любую модель AlfaGen
+profiles:
+  glm:
+    base_url: "https://api.z.ai/api/coding/paas/v4"
+    model: "glm-5.3"          # ← поменяй здесь
 ```
 
-Доступные модели AlfaGen (взяты из корпоративного конфига opencode):
+| Модель | Для чего |
+|---|---|
+| `glm-5.3` | **по умолчанию** — универсальная, тянет и спеки, и код |
+| `glm-4.6` | предыдущее поколение, дешевле по лимиту |
 
-| Модель | Контекст | Для чего |
-|---|---|---|
-| `DeepSeek-V4.1-Flash` | 1M | **по умолчанию** — быстрая, хороший баланс для всей документации |
-| `Qwen/Qwen3-Coder-Next` | 256K | кодогенерация (модель-кодер, свежая) |
-| `Qwen/Qwen3-Coder-30B-A3B-Instruct` | 256K | кодогенерация, полегче |
-| `Qwen/Qwen3.5-397B-A17B-FP8` | 256K | сложная архитектура, большие спеки |
-| `GLM-5.2` | 1M | альтернатива DeepSeek с большим контекстом |
-| `zai-org/GLM-5-FP8` | 205K | GLM поменьше |
-| `moonshotai/Kimi-K2-Thinking` | 256K | «думающая» модель — краевые случаи в спеке |
-| `MiniMaxAI/MiniMax` | 195K | — |
-| `openai/gpt-oss-120b` | 128K | — |
-| `Qwen/Qwen3-235B-A22B-Instruct-2507-FP8` | 240K | — |
-| `VIP-EVC-DeepSeek-V4-Flash` | 1M | выделенный инстанс DeepSeek (остался на V4) |
-| `VIP-SFA-GLM-5.1` | 200K | выделенный инстанс GLM |
+Актуальный список — в личном кабинете Z.AI: набор моделей в подписке
+меняется, а обращение к исчезнувшей даёт `404`.
 
-Список сверен с `~/.config/opencode/opencode.json` — это точка правды по тому,
-что шлюз реально отдаёт. Устаревшего `DeepSeek-V4-Flash` (без `.1`) там больше
-нет: запрос к нему вернёт 404. Если модель пропала или появилась новая —
-сверяйся с этим файлом, а не с таблицей выше.
-
-У большинства моделей `output` = 30 000 токенов, поэтому `max_tokens: 30000`
-в `ai_settings` выставлен под потолок. Поднимать выше бессмысленно — шлюз
-обрежет.
+**Про размышления.** GLM — думающая модель: сначала генерирует рассуждения,
+потом ответ, и `max_tokens` у них **общий**. На кодогенерации это приводило
+к пустым ответам после нескольких минут работы. Отключается в
+`code_generation.extra_params` — см. раздел про `extra_params`.
 
 **Способ 2 — на один запуск (флаг `--model`), без правки конфига:**
 
 ```bash
-# спеку — DeepSeek, а код — моделью-кодером:
-./openspec.py --new "хочу поиск по заказам" --model DeepSeek-V4.1-Flash
-./openspec.py --codegen --change 2 --model Qwen/Qwen3-Coder-30B-A3B-Instruct
+# спеку одной моделью, а код другой:
+./openspec.py --new "хочу поиск по заказам" --model glm-5.3
+./openspec.py --codegen --change 2 --model glm-4.6
 ```
 
 Флаг переопределяет `model` из конфига только для текущей команды.
@@ -505,8 +493,8 @@ active_profile: "glm"   # поменял здесь — сменилось во 
 
 | Профиль | Что это | Когда |
 |---|---|---|
-| `alfagen` | рабочий шлюз AlfaGen | по умолчанию, нужна корпсеть или VPN |
-| `local` | локальная Ollama на своей машине | когда VPN недоступен |
+| `glm` | Z.AI Coding Plan | по умолчанию |
+| `local` | локальная Ollama | когда нет сети |
 
 `base_url`, `model` и ключ живут внутри профиля и больше нигде: в
 `ai_settings` остались только параметры, от провайдера не зависящие
@@ -516,7 +504,7 @@ active_profile: "glm"   # поменял здесь — сменилось во 
 
 ```bash
 ./openspec.py --new "..." --profile local            # локальная модель
-./openspec.py --codegen --change 2 --profile alfagen  # рабочий шлюз
+./openspec.py --codegen --change 2 --profile glm  # рабочий шлюз
 ```
 
 Приоритет: `--model` > `--profile` > `active_profile`.
@@ -527,7 +515,7 @@ active_profile: "glm"   # поменял здесь — сменилось во 
 хост. Активный профиль печатается в начале каждого запуска:
 
 ```
-Профиль 'alfagen': model=DeepSeek-V4.1-Flash, base_url=https://alfagen.moscow.alfaintra.net/continue-dev
+Профиль 'glm': model=glm-5.3, base_url=https://api.z.ai/api/coding/paas/v4
 ```
 
 ### Добавить свой профиль (внешний провайдер)
@@ -538,7 +526,7 @@ active_profile: "glm"   # поменял здесь — сменилось во 
 
 ```yaml
 profiles:
-  # ... alfagen и local ...
+  # ... glm и local ...
 
   glm:                                   # Z.AI Coding Plan
     # У Coding Plan свой endpoint — /api/coding/paas/v4.
@@ -561,9 +549,9 @@ profiles:
 истории коммитов остаётся навсегда, даже если убрать его из текущей версии.
 
 Для кодогенерации Java настоятельно рекомендую **модель-кодер** —
-`Qwen/Qwen3-Coder-30B-A3B-Instruct` на AlfaGen (или `gpt-4o` /
-`claude-sonnet` на внешних провайдерах). Универсальные модели среднего
-размера часто выдают неполные файлы.
+модель посильнее: универсальные модели среднего размера часто выдают
+неполные файлы — обрывают их на середине или молча пропускают задачи
+из плана.
 
 ### Проверить, что всё живо
 
@@ -934,7 +922,7 @@ openspec <команды>
 | `--dry-run` | `--codegen` | Показать список файлов, но не записывать |
 | `--yes` / `-y` | `--codegen` | Не спрашивать подтверждение записи |
 | `--model NAME` | все LLM-команды | Модель на один запуск (переопределяет `config.yaml`) |
-| `--profile NAME` | все LLM-команды | Профиль (`alfagen` / `local`) на один запуск, переопределяет `active_profile` |
+| `--profile NAME` | все LLM-команды | Профиль (`glm` / `local`) на один запуск, переопределяет `active_profile` |
 | `--branch` | `--new` | Создать git-ветку `spec/<change-id>` для изоляции |
 
 ### Как указывать `--change`
@@ -1065,9 +1053,9 @@ project_context:
 active_profile: "glm"        # --profile <name> переопределяет на один запуск
 
 profiles:
-  alfagen:                       # рабочий шлюз (основной, нужна корпсеть/VPN)
-    base_url: "https://alfagen.moscow.alfaintra.net/continue-dev"
-    model: "DeepSeek-V4.1-Flash"
+  glm:                           # Z.AI Coding Plan (основной)
+    base_url: "https://api.z.ai/api/coding/paas/v4"
+    model: "glm-5.3"
     api_key_env: "ZAI_API_KEY"   # только env, не строкой в файле
     verify_ssl: false            # внутренний CA
   local:                         # локальная Ollama, когда VPN недоступен
@@ -1129,7 +1117,7 @@ profiles:
 в репозиторий. Теперь движок падает с объяснением:
 
 ```
-✖ В профиле 'alfagen' задан api_key прямо в config.yaml.
+✖ В профиле 'glm' задан api_key прямо в config.yaml.
   Конфиг уходит в git — секрет из истории потом не убрать.
   Убери строку api_key и держи ключ в переменной окружения,
   имя которой указано в api_key_env.
@@ -1365,7 +1353,7 @@ rm -rf .opencode
 (быстро, детерминированно); **агент** → `opencode run --model
 <провайдер/модель> "..."` как subprocess (своя сессия, можно несколько
 параллельно — скиллы из `.opencode/` подхватятся, потому что лежат в
-рабочей директории проекта). Профили `alfagen`/`local` из `config.yaml`
+рабочей директории проекта). Профили `glm`/`local` из `config.yaml`
 плагин унаследует автоматически.
 
 ---
@@ -1374,13 +1362,13 @@ rm -rf .opencode
 
 | Симптом | Причина и решение |
 |---|---|
-| `./openspec.py: No such file or directory` | Проект не развёрнут. Одна команда: `uvx --from git+file:///Users/mikhailbutorin/programmer/creator@master openspec --init` |
+| `./openspec.py: No such file or directory` | Проект не развёрнут. Одна команда: `uvx --from git+https://github.com/MoshkaBortmanStar/creator.git@master openspec --init` |
 | `Не найден uvx` | `brew install uv` (macOS/Linux), `winget install astral-sh.uv` (Windows) |
 | `permission denied: ./openspec.py` | `chmod +x openspec.py`, либо запускай `python openspec.py ...` |
 | `Не найден uvx` | `brew install uv` |
 | `Это не проект OpenSpec` | В каталоге и выше нет `.agent/config.yaml`. Развернуть: `./openspec.py --init` |
 | `Профиль не выбран` | В `config.yaml` нет `active_profile` и не передан `--profile`. Провайдер задаётся только профилем, дефолта нет |
-| `LLM недоступна (...)` | Не поднята модель / неверный `base_url` в активном профиле / нет ключа. AlfaGen работает **только из корпоративной сети или VPN** (вне сети домен не резолвится). Проверь: `curl -k https://alfagen.moscow.alfaintra.net/continue-dev/models`. Или работай с `--offline` |
+| `LLM недоступна (...)` | Не поднята модель / неверный `base_url` в активном профиле / нет ключа. Частая причина у Z.AI — endpoint: у Coding Plan это `/api/coding/paas/v4`, а не `/api/paas/v4`. Или работай с `--offline` |
 | LLM вернула пустые/обрезанные файлы | Увеличь `max_tokens` в конфиге, возьми модель-кодер побольше |
 | `Отклонён небезопасный путь` при кодогенерации | Модель попыталась записать файл за пределами проекта — скрипт её остановил. Перегенерируй (`--codegen`) |
 | `--change 1` → `не найдено` | Смотри точное имя: `--list`. Номер работает, если изменение с этим номером единственное |

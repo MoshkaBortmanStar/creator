@@ -535,10 +535,52 @@ def codegen_llm_settings(cfg: Dict) -> LLMSettings:
     ai_settings.extra_params и действует только на этот шаг.
     """
     settings = load_llm_settings(cfg)
-    override = (cfg.get("code_generation") or {}).get("extra_params")
+    codegen = cfg.get("code_generation") or {}
+
+    # Модель отдельно для этого шага. Главный случай — думающие модели:
+    # часть шлюзов игнорирует thinking: disabled и всё равно присылает
+    # reasoning, который съедает общий с ответом max_tokens, и content
+    # приходит пустым. Модель-кодер не размышляет вовсе, поэтому проблема
+    # снимается не настройкой, а выбором модели именно на кодогенерации.
+    model = codegen.get("model")
+    if model:
+        settings.model = model
+        info("Модель кодогенерации: {}".format(model))
+
+    # Лимит ответа тоже может отличаться: у кодера он нередко больше.
+    max_tokens = codegen.get("max_tokens")
+    if max_tokens:
+        settings.max_tokens = int(max_tokens)
+        info("max_tokens кодогенерации: {}".format(max_tokens))
+
+    override = codegen.get("extra_params")
     if override:
         settings.extra = _deep_merge(settings.extra, override)
     return settings
+
+
+def explain_empty_answer() -> None:
+    """Что делать, когда модель вернула пустой content."""
+    print()
+    info("Модель израсходовала max_tokens на размышления и не дошла до ответа.")
+    info("Чем короче промпт, тем меньше она размышляет. Рычаги по силе:")
+    print("  - --batch 1                             одна задача за запрос")
+    print("  - code_generation.project_map: false    убрать карту проекта")
+    print("  - code_generation.model                 другая модель на этот шаг")
+    print("  - ai_settings.max_tokens побольше       если у модели есть запас")
+    print()
+    info("thinking: disabled помогает не на всех шлюзах — AlfaGen этот")
+    info("параметр игнорирует и присылает reasoning при любых настройках.")
+    print()
+
+
+class EmptyAnswer(RuntimeError):
+    """Модель вернула пустой content.
+
+    Отдельный тип, потому что это не сбой связи: повторять запрос тем же
+    промптом бессмысленно — бюджет max_tokens уйдёт на размышления так же.
+    Лечится сменой модели или уменьшением промпта, а не ретраем.
+    """
 
 
 FILE_HEADER_RE = re.compile(r"###\s*FILE:\s*([^\s`\n]+)")
@@ -647,9 +689,15 @@ def llm_chat(settings: LLMSettings, system: str, user: str,
                 content = _stream_response(requests, url, headers, payload,
                                            settings, progress)
                 if not content.strip():
-                    raise RuntimeError("пустой ответ в потоковом режиме")
+                    raise EmptyAnswer("модель не вернула содержимого")
             else:
-                response = requests.post(url, json=payload, headers=headers,
+                # stream передаём ЯВНО: часть шлюзов (AlfaGen) отвечает 400,
+                # если поля нет в теле совсем. Раньше здесь уходил payload
+                # без него — потоковый режим добавлял stream в свою копию,
+                # а этот запрос оставался без поля, и fallback гарантированно
+                # падал. Из трёх попыток рабочей была одна.
+                response = requests.post(url, json=dict(payload, stream=False),
+                                         headers=headers,
                                          timeout=settings.timeout,
                                          verify=settings.verify_ssl)
                 response.raise_for_status()
@@ -658,11 +706,17 @@ def llm_chat(settings: LLMSettings, system: str, user: str,
                 if not content.strip():
                     # Думающая модель могла израсходовать весь max_tokens на
                     # reasoning_content и не дойти до ответа.
-                    raise RuntimeError(
-                        "пустой ответ (finish_reason={}) — вероятно, весь "
-                        "max_tokens ушёл на размышления"
+                    raise EmptyAnswer(
+                        "модель не вернула содержимого (finish_reason={})"
                         .format(body.get("finish_reason")))
             return clean_llm_output(content)
+        except EmptyAnswer:
+            # Пустой ответ — не сбой связи, а исчерпанный бюджет: модель
+            # потратила max_tokens на размышления. Повтор тем же промптом
+            # даст то же самое, только через несколько минут ожидания.
+            # Решение за вызывающим: кодогенерация умеет дробить батч,
+            # остальным шагам остаётся сообщить пользователю.
+            raise
         except Exception as exc:  # noqa: BLE001 — показываем пользователю любую
             last_error = exc
             warn("Попытка {} из 3 не удалась: {}".format(attempt, exc))
@@ -1905,31 +1959,66 @@ def codegen_batched(change_dir: Path, settings: "LLMSettings", system: str,
         for block in batch:
             print("  {}".format(block.splitlines()[0][:100]))
 
-        parts = list(sections)
-        parts.append(plan_outline)
-        parts.append("Задачи ЭТОГО шага — реализуй только их:\n---\n{}\n---"
-                     .format("\n\n".join(batch)))
-        touched = touched_files_context(batch)
-        if touched:
-            parts.append(touched)
-        if done:
-            parts.append(generated_context(done))
+        def ask(tasks: List[str]) -> str:
+            """Один запрос по списку задач."""
+            parts = list(sections)
+            parts.append(plan_outline)
+            parts.append("Задачи ЭТОГО шага — реализуй только их:\n---\n{}\n---"
+                         .format("\n\n".join(tasks)))
+            touched = touched_files_context(tasks)
+            if touched:
+                parts.append(touched)
+            if done:
+                parts.append(generated_context(done))
+            return llm_chat(settings, system, "\n\n".join(parts), progress=True)
 
-        raw = llm_chat(settings, system, "\n\n".join(parts), progress=True)
+        # Думающая модель тратит max_tokens на размышления, и на длинном
+        # промпте до ответа не доходит. Длина размышлений зависит от размера
+        # промпта, поэтому дробим батч и повторяем — вплоть до одной задачи
+        # за запрос. Шлюз AlfaGen игнорирует thinking: disabled, так что
+        # иначе с думающей моделью батч просто не проходит.
+        # Ответы всех кусков склеиваются: collect_files разберёт блоки
+        # из объединённого текста. Важно обойти ВСЕ куски, а не остановиться
+        # на первом удачном — иначе вторая половина задач молча потерялась бы.
+        #
+        # Оговорка: внутри одного батча куски не видят файлы друг друга —
+        # на диск батч пишется целиком, после разбора. Если второй кусок
+        # должен опираться на первый, план стоит разбить на два батча.
+        raws: List[str] = []
+        chunks = [batch]
+        while chunks:
+            chunk = chunks.pop(0)
+            try:
+                raws.append(ask(chunk))
+            except EmptyAnswer:
+                if len(chunk) == 1:
+                    err("Пустой ответ даже на одной задаче.")
+                    explain_empty_answer()
+                    info("Прогресс сохранён на батче {}. Повторный запуск "
+                         "продолжит с батча {}.".format(index - 1, index))
+                    fail("Кодогенерация остановлена.")
+                half = len(chunk) // 2
+                warn("Пустой ответ на {} задачах — дроблю на {} и {}"
+                     .format(len(chunk), half, len(chunk) - half))
+                chunks = [chunk[:half], chunk[half:]] + chunks
+        raw = "\n\n".join(raws)
 
         valid = collect_files(raw, change_dir)
         if not valid:
             # Дальше идти нельзя: следующие батчи опираются на код этого.
             # Прогресс остался на предыдущем батче — повторный запуск
             # продолжит именно отсюда, а не проскочит дырку.
+            # Ответ пришёл, но разобрать нечего — это НЕ исчерпанный бюджет
+            # (тот случай ловится выше как EmptyAnswer и дробит батч).
+            # Значит модель ответила не в том формате.
             err("Батч {} не вернул ни одного файла.".format(index))
             show_raw_tail(raw)
             print()
-            info("Частая причина: модель израсходовала max_tokens на "
-                 "размышления и не дошла до ответа.")
-            print("  - подними max_tokens в .agent/config.yaml")
-            print("  - или отключи размышления: ai_settings.extra_params")
-            print("  - или уменьши размер батча: --batch 2")
+            info("Ответ есть, но в нём нет блоков '### FILE:' — модель "
+                 "не соблюла формат.")
+            print("  - перезапусти: формат нестабилен, со второго раза обычно выходит")
+            print("  - или смени модель на этот шаг: code_generation.model")
+            print("  - или уменьши батч: --batch 1")
             print()
             info("Прогресс сохранён на батче {}. Повторный запуск "
                  "продолжит с батча {}.".format(index - 1, index))
@@ -2372,24 +2461,27 @@ def analyse_with_llm(root: Path, found: Dict, cfg: Dict) -> Optional[Dict]:
 # Откуда брать движок. Подставляется в обёртку openspec.py при --init.
 # Ветка (@master) — всегда свежий; тег или SHA — фиксирует версию.
 # При форке репозитория поправь здесь.
-ENGINE_SOURCE = "git+file:///Users/mikhailbutorin/programmer/creator@master"
+ENGINE_SOURCE = "git+https://github.com/MoshkaBortmanStar/creator.git@master"
 
 
 # ---------------------------------------------------------------------------
 # Что --init вносит в .gitignore проекта
 #
-# Граница простая: в git уходит то, что нужно КОЛЛЕГЕ, чтобы получить тот же
-# результат — конфиг проекта, обёртка запуска и спеки. Игнорируется то, что
-# каждый разворачивает у себя сам: инструкции агенту.
+# Граница: в git уходит только то, что нельзя получить заново — конфиг
+# проекта и спеки. Всё, что --init создаёт из данных пакета (обёртка,
+# инструкции агенту, скиллы), каждый разворачивает у себя той же командой,
+# поэтому в репозиторий не попадает.
 # ---------------------------------------------------------------------------
 
 GITIGNORE_MARKER = "# --- OpenSpec Change Driver ---"
 
 GITIGNORE_BLOCK = """{marker}
-# Инструкции агенту: разворачиваются командой
-# `uvx --from <источник-движка> openspec --init` у каждого локально.
-# В репозиторий не уходят — не навязываем их тем, кто работает без агента,
-# и обновляются они вместе с движком, а не правками в проекте.
+# Всё это разворачивается командой
+#   uvx --from <источник-движка> openspec --init
+# у каждого локально и обновляется вместе с движком. В репозиторий
+# не уходит: обёртка генерируется заново одинаковой, а инструкции агенту
+# не стоит навязывать тем, кто работает без агента.
+openspec.py
 .opencode/
 AGENTS.md
 # --- /OpenSpec Change Driver ---
@@ -2530,7 +2622,7 @@ def cmd_init(args: argparse.Namespace) -> None:
 
     changed = ensure_gitignore(target_root)
     if changed:
-        ok(".gitignore {} (.opencode/, AGENTS.md)".format(changed))
+        ok(".gitignore {} (openspec.py, .opencode/, AGENTS.md)".format(changed))
     else:
         ok(".gitignore уже содержит блок OpenSpec — не тронут")
 
@@ -2658,6 +2750,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg["ai_settings"]["base_url"]))
     if args.model:
         cfg["ai_settings"]["model"] = args.model
+        # Флаг сильнее конфига на ВСЕХ шагах, включая кодогенерацию:
+        # иначе code_generation.model молча перебил бы явный выбор.
+        cfg.setdefault("code_generation", {})["model"] = args.model
         info("Модель на этот запуск: {}".format(args.model))
 
     if args.main:

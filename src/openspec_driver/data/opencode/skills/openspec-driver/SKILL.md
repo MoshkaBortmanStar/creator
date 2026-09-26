@@ -29,7 +29,7 @@ python openspec.py --list     # Windows
 - Печатает профиль и список изменений → работай по шагам ниже.
 - `No such file or directory` → проект не развёрнут. Одна команда:
   ```bash
-  uvx --from git+file:///Users/mikhailbutorin/programmer/creator@master openspec --init
+  uvx --from git+https://github.com/MoshkaBortmanStar/creator.git@master openspec --init
   ```
   Она создаст конфиг, `specs/`, скиллы и саму обёртку.
 - `Не найден uvx` → `brew install uv` (macOS/Linux) или
