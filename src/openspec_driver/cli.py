@@ -1052,21 +1052,42 @@ def change_number(change_id: str) -> str:
     return match.group(1) if match else change_id
 
 
-def commit_spec(change_id: str) -> bool:
+# Сообщение коммита спеки. Формат задаётся в конфиге, потому что в проектах
+# стоят хуки commit-msg (semantic-release, semantic-gradle-plugin и подобные),
+# которые отклоняют всё, что не по Conventional Commits. Прежнее «spec: <id>»
+# такой хук заворачивал, коммит падал, и worktree не создавался вовсе.
+# По умолчанию docs(spec): спека — это документация, и префикс docs
+# принимают практически все настройки хуков.
+DEFAULT_SPEC_COMMIT = "docs(spec): {change_id}"
+
+
+def spec_commit_message(change_id: str, cfg: Optional[Dict] = None) -> str:
+    template = ((cfg or {}).get("pipeline") or {}).get(
+        "spec_commit_message") or DEFAULT_SPEC_COMMIT
+    return template.format(change_id=change_id)
+
+
+def commit_spec(change_id: str, cfg: Optional[Dict] = None) -> bool:
     """Закоммитить только папку спеки — чужие staged-файлы не затрагиваются."""
     rel = "specs/{}".format(change_id)
     if git("add", "--", rel).returncode != 0:
         warn("git add {} не удался — worktree не создан".format(rel))
         return False
-    result = git("commit", "-m", "spec: {}".format(change_id), "--", rel)
+    message = spec_commit_message(change_id, cfg)
+    result = git("commit", "-m", message, "--", rel)
     output = result.stdout + result.stderr
     if result.returncode == 0:
-        ok("спека закоммичена: spec: {}".format(change_id))
+        ok("спека закоммичена: {}".format(message))
         return True
     if "nothing to commit" in output or "no changes added" in output:
         warn("нечего коммитить — спека уже в истории")
         return True
     warn("Не удалось закоммитить спеку: {}".format(output.strip()))
+    # Частая причина — хук commit-msg проекта не принимает формат сообщения.
+    # Шаблон настраивается, движок его не навязывает.
+    info("Если это хук commit-msg, задай свой формат в .agent/config.yaml:")
+    print("  pipeline:")
+    print('    spec_commit_message: "chore(spec): {change_id}"')
     return False
 
 
@@ -1113,19 +1134,40 @@ def setup_worktree(change_id: str, change_dir: Path, cfg: Dict) -> None:
         return
 
     # Метаданные пишем ДО коммита, чтобы они уехали в историю вместе со спекой.
-    meta = load_change_meta(change_dir)
+    # Но если дальше что-то сорвётся — откатываем: иначе в change.yaml остаётся
+    # ссылка на worktree, которого нет, и следующий запуск считает привязку
+    # существующей и не пытается создать его заново. Так уже ловили: коммит
+    # отклонял хук проекта, а запись оставалась и блокировала все дальнейшие
+    # попытки, включая ручные.
+    meta_before = load_change_meta(change_dir)
+    meta = dict(meta_before)
     meta["git"] = {"branch": branch, "worktree": str(path),
                    "base_branch": base_branch}
     meta["updated"] = now_str()
     save_change_meta(change_dir, meta)
 
-    if not commit_spec(change_id):
+    def rollback_meta() -> None:
+        save_change_meta(change_dir, meta_before)
+        info("Привязка к worktree откачена — следующий запуск попробует снова.")
+
+    if not commit_spec(change_id, cfg):
+        rollback_meta()
         return
 
-    result = git("worktree", "add", str(path), "-b", branch)
+    # Ветка могла остаться от прошлой неудачной попытки (коммит отклонил хук,
+    # worktree удалили руками). Тогда -b падает с «branch already exists» —
+    # подключаемся к существующей вместо создания новой.
+    branch_exists = git("rev-parse", "--verify", "--quiet",
+                        "refs/heads/{}".format(branch)).returncode == 0
+    if branch_exists:
+        info("Ветка {} уже существует — worktree подключается к ней".format(branch))
+        result = git("worktree", "add", str(path), branch)
+    else:
+        result = git("worktree", "add", str(path), "-b", branch)
     if result.returncode != 0:
         warn("Не удалось создать worktree: {}".format(
             (result.stderr or result.stdout).strip()))
+        rollback_meta()
         return
 
     ok("worktree: {}".format(path))
@@ -1338,8 +1380,17 @@ def ensure_worktree(change_dir: Path, args: argparse.Namespace,
         return
     if not (cfg.get("pipeline") or {}).get("auto_worktree", True):
         return
-    if (load_change_meta(change_dir).get("git") or {}).get("worktree"):
-        return  # привязка уже есть (существующая или смердженная)
+    recorded = (load_change_meta(change_dir).get("git") or {}).get("worktree")
+    if recorded:
+        if Path(recorded).is_dir():
+            return                      # worktree на месте, всё в порядке
+        # Запись есть, каталога нет. Либо worktree удалили после мерджа,
+        # либо его создание когда-то сорвалось. В обоих случаях молчать нельзя:
+        # без worktree кодоген пишет прямо в рабочую ветку, а пользователь
+        # об этом не узнаёт. Сообщаем и заводим заново.
+        warn("В change.yaml записан worktree {}, но его нет на диске."
+             .format(recorded))
+        info("Создаю заново (отключить: --here)")
     if not is_git_repo():
         return
     if git("rev-parse", "HEAD").returncode != 0:
@@ -2509,6 +2560,75 @@ def ensure_gitignore(root: Path) -> Optional[str]:
     return "дополнен" if existing else "создан"
 
 
+WRAPPER_ENGINE_RE = re.compile(r'^ENGINE\s*=\s*"([^"]+)"', re.M)
+
+
+def project_engine_source() -> str:
+    """
+    Откуда проект берёт движок.
+
+    Источник читаем из обёртки openspec.py проекта, а не из константы
+    ENGINE_SOURCE: обёртку могли поправить под другой тег или форк, и
+    обновлять надо именно то, что реально запускается. Нет обёртки —
+    откатываемся на константу, зашитую при сборке.
+    """
+    if PROJECT_ROOT is not None:
+        wrapper = PROJECT_ROOT / "openspec.py"
+        if wrapper.is_file():
+            match = WRAPPER_ENGINE_RE.search(wrapper.read_text(encoding="utf-8"))
+            if match:
+                return match.group(1)
+    return ENGINE_SOURCE
+
+
+def cmd_update(_: argparse.Namespace) -> None:
+    """
+    --update: подтянуть свежий движок из git.
+
+    Зачем отдельная команда: обёртка запускает движок через uvx, а uv
+    кеширует, какой коммит он под веткой уже видел, и сам не перепроверяет.
+    Поэтому после push в репозиторий движка проект продолжает работать
+    на старой сборке — молча, пока кто-нибудь не догадается про --refresh.
+    Эта команда делает refresh за тебя.
+    """
+    banner("Обновление движка")
+    source = project_engine_source()
+    info("Источник: {}".format(source))
+    info("Текущая версия: {}".format(package_version()))
+
+    if shutil.which("uvx") is None:
+        fail("Не найден uvx (входит в uv): brew install uv")
+
+    print()
+    info("Перечитываю источник (uvx --refresh)...")
+    result = subprocess.run(
+        ["uvx", "--refresh", "--from", source, "openspec", "--version"],
+        capture_output=True, text=True)
+
+    if result.returncode != 0:
+        err((result.stderr or result.stdout).strip())
+        fail("Не удалось обновить движок.")
+
+    # Версию берём из вывода дочернего процесса: он уже на НОВОЙ сборке,
+    # а мы всё ещё выполняемся на старой.
+    new_version = "неизвестна"
+    for line in result.stdout.splitlines():
+        if line.startswith("openspec-driver "):
+            new_version = line.split(None, 1)[1].strip()
+            break
+
+    print()
+    if new_version == package_version():
+        ok("Уже актуальная версия: {}".format(new_version))
+        return
+
+    ok("Обновлено: {} → {}".format(package_version(), new_version))
+    print()
+    info("Скиллы агента и AGENTS.md обновляются отдельно — они разворачиваются")
+    info("в проект и existing файлы --init не перезаписывает:")
+    print("  rm -rf .opencode AGENTS.md && ./openspec.py --init --offline")
+
+
 def cmd_init(args: argparse.Namespace) -> None:
     """
     --init: развернуть проектную часть в ТЕКУЩЕМ каталоге.
@@ -2729,6 +2849,8 @@ def build_parser() -> argparse.ArgumentParser:
                              "тесты прошли")
     parser.add_argument("--version", action="store_true",
                         help="версия движка и путь, откуда он запущен")
+    parser.add_argument("--update", action="store_true",
+                        help="подтянуть свежий движок из git (uvx --refresh)")
     parser.add_argument("--init", action="store_true",
                         help="развернуть структуру .agent/ в этом проекте")
     return parser
@@ -2744,8 +2866,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("  проект:  {}".format(root or "не найден (нет .agent/config.yaml)"))
         return 0
 
-    # --init работает вне проекта: он его и создаёт. Проверка корня
-    # и чтение конфига идут после неё.
+    # Эти две работают вне проекта: --init его создаёт, --update обновляет
+    # сам движок. Проверка корня и чтение конфига идут после них.
+    if args.update:
+        cmd_update(args)
+        return 0
     if args.init:
         cmd_init(args)
         return 0

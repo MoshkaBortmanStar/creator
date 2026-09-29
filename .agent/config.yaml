@@ -123,6 +123,16 @@ pipeline:
   # Разовое отключение: флаг --here (генерировать в текущей директории).
   auto_worktree: true
 
+  # Сообщение коммита спеки. Движок коммитит папку specs/<id> перед созданием
+  # worktree, и в проектах с хуком commit-msg (semantic-release,
+  # semantic-gradle-plugin) формат сообщения обязан быть по Conventional Commits,
+  # иначе коммит отклоняется и worktree не создаётся.
+  #
+  # Плейсхолдер {change_id} подставляется движком.
+  # По умолчанию: "docs(spec): {change_id}"
+  #
+  # spec_commit_message: "chore(spec): {change_id}"
+
   # Локальные файлы вне git — копируются в новый worktree при создании.
   # Они в .gitignore, поэтому сами туда не попадают, и сборка падает
   # не из-за кода, а из-за окружения. Зависит от стека:
